@@ -1,0 +1,8 @@
+.venv
+.git
+__pycache__
+*.pyc
+.env
+out*.csv
+out*.xlsx
+docs

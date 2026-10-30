@@ -1,0 +1,5 @@
+# Optional: EXTRACT_BACKEND=docling (layout/table model + OCR for images and scans in no-key mode).
+# Heavy: ~1.6 GB of packages (PyTorch) plus ~650 MB of models downloaded on first use. Too heavy for a free Render instance (512 MB); run it locally or on a VPS.
+# On Windows, create the venv in a SHORT path (e.g. C:\dl\v); the default long paths break the PyTorch install.
+-r requirements.txt
+docling==2.145.0

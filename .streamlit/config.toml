@@ -1,0 +1,15 @@
+[server]
+headless = true
+maxUploadSize = 50
+# Hugging Face Spaces serves the app inside an iframe on a different origin; with XSRF protection on, the file
+# uploader returns 403 there. This app has no login or per-user state to protect. For a private deployment that
+# enables the optional Google Sheets push, set both of these back to true.
+enableXsrfProtection = false
+enableCORS = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#1f3a5f"

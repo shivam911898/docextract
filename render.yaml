@@ -1,0 +1,13 @@
+# Render blueprint for the free public demo. See DEPLOY.md (section A).
+# Render dashboard -> New -> Blueprint -> pick the GitHub repo shivam911898/docextract.
+services:
+  - type: web
+    name: docextract
+    runtime: docker
+    plan: free
+    healthCheckPath: /_stcore/health   # Streamlit's built-in health endpoint
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false                    # secret: Render asks for the value in the dashboard, it is never stored in git
+      - key: MAX_FILES
+        value: "10"
