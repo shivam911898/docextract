@@ -365,9 +365,8 @@ def extract_groq(data: bytes, filename: str, text: str) -> Tuple[Document, str, 
     if not _usable(text):
         text, score = scan_text(data, filename)
         source = "ocr"
-    model = llm.groq_text_model()
     prompt = GROQ_PROMPT + (OCR_NOTE if source == "ocr" else "") + "\nDocument text:\n" + text[:GROQ_TEXT_CHARS]
-    reply = llm.groq_chat_json([{"role": "user", "content": prompt}], model)
+    reply, model = llm.groq_chat_json_model([{"role": "user", "content": prompt}], llm.groq_text_model())  # model = the one that answered
     return _doc_from_json(reply), model, source, score
 
 

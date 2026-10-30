@@ -51,6 +51,7 @@ itself, so skip `git lfs install` (or delete `.gitattributes`) and plain binarie
    | `GROQ_API_KEY` | free key from <https://console.groq.com/keys>. Treat it as a secret: enter it only here (or at the blueprint prompt), never in the repo |
    | `MAX_FILES` | `10` (already the default; lower it, e.g. `5`, to protect a busy public demo's free quota) |
    | `GROQ_TEXT_MODEL` (optional) | leave unset (default `openai/gpt-oss-120b`); `openai/gpt-oss-20b` is faster and cheaper. Confirm live ids with `GET https://api.groq.com/openai/v1/models` |
+   | `GROQ_FALLBACK_MODEL` (optional) | leave unset (default `openai/gpt-oss-20b`): used automatically when the primary model's daily cap is hit, so a live demo keeps working |
    | `GEMINI_API_KEY` (optional) | only if the demo must read scans and photos: also add `LLM_PROVIDER` = `gemini` (Groq reads text only, and wins by default when both keys exist) |
 
 7. **Advanced** -> **Health Check Path**: `/_stcore/health` (Streamlit's built-in health endpoint).

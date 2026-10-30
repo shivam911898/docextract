@@ -18,6 +18,7 @@ Runs everything that can be verified offline, with no API key and no network:
      Groq server, a scanned PDF is OCR'd, the wrong-total Greenleaf invoice is still flagged. Skipped otherwise.
   7. Only if docling is installed: the optional EXTRACT_BACKEND=docling path (incl. OCR of the PNG receipt).
 """
+import contextlib
 import io
 import json
 import os
@@ -43,7 +44,7 @@ import llm  # noqa: E402
 import make_samples  # noqa: E402
 import ocr  # noqa: E402
 
-for _k in ("LLM_PROVIDER", "GEMINI_BASE_URL", "GROQ_BASE_URL", "GROQ_TEXT_MODEL", "OCR_BACKEND"):
+for _k in ("LLM_PROVIDER", "GEMINI_BASE_URL", "GROQ_BASE_URL", "GROQ_TEXT_MODEL", "GROQ_FALLBACK_MODEL", "OCR_BACKEND"):
     os.environ.pop(_k, None)           # a stray .env must not change what is being verified
 core.MAX_FILES = 10
 
@@ -387,8 +388,44 @@ def stage_groq_mock():
         r = run("inv1_acme_supplies.pdf")
         check(len(FakeGroq.seen) == 1 and r["needs_review"] and "401" in r["reasons"], "401 invalid key: no retries, Needs review")
         fake(fallback=err(429, "Rate limit reached (tokens per day)", {"Retry-After": "3600"}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            r = run("inv1_acme_supplies.pdf")
+        check(len(FakeGroq.seen) == 2 and r["needs_review"] and "quota" in r["reasons"] and "fallback" in r["reasons"],
+              "daily cap on both models (Retry-After of an hour): one fallback try, then fail fast with a clear reason")
+
+        # --- daily token cap (TPD) on the primary model: the same request is retried ONCE on GROQ_FALLBACK_MODEL
+        tpd = ("Rate limit reached for model `openai/gpt-oss-120b` in organization `org_test` service tier `on_demand` on tokens per day "
+               "(TPD): Limit 200000, Used 199724, Requested 923. Please try again in 4m39.504s. Need more tokens? Upgrade to Dev Tier")
+        fake([err(429, tpd, {"Retry-After": "280"}), None])
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            r = run("inv1_acme_supplies.pdf")
+        a, b = (s["body"] for s in FakeGroq.seen[:2])
+        check(len(FakeGroq.seen) == 2 and a["model"] == "openai/gpt-oss-120b" and b["model"] == "openai/gpt-oss-20b"
+              and a["messages"] == b["messages"] and r["model"] == "openai/gpt-oss-20b" and r["mode"] == "groq"
+              and r["document"].total == 199.23 and not r["needs_review"],
+              f"TPD 429 on the primary: same request retried on {llm.GROQ_DEFAULT_FALLBACK_MODEL}, row clean, row reports the fallback model")
+        check(log.getvalue().count("fallback") == 1 and "fake-groq-key" not in log.getvalue(), "fallback logs exactly one line, no API key in it")
+        fake([err(429, tpd), None])
+        with contextlib.redirect_stderr(io.StringIO()):
+            r = run("inv1_acme_supplies.pdf")
+        check(r["model"] == "openai/gpt-oss-20b" and not r["needs_review"], "TPD 429 without a Retry-After header: fallback too")
+        fake([err(429, "Rate limit reached for model on requests per minute")] * llm.GROQ_RETRY_ATTEMPTS + [None])
+        with contextlib.redirect_stderr(io.StringIO()):
+            r = run("inv1_acme_supplies.pdf")
+        check(len(FakeGroq.seen) == llm.GROQ_RETRY_ATTEMPTS + 1 and r["model"] == "openai/gpt-oss-20b" and not r["needs_review"],
+              f"a 429 that survives all {llm.GROQ_RETRY_ATTEMPTS} retries: one more try on the fallback ({len(FakeGroq.seen)} calls)")
+        fake(fallback=err(500, "internal error"))
         r = run("inv1_acme_supplies.pdf")
-        check(len(FakeGroq.seen) == 1 and r["needs_review"] and "quota" in r["reasons"], "429 with Retry-After of an hour: fail fast with a clear reason")
+        check(len(FakeGroq.seen) == llm.GROQ_RETRY_ATTEMPTS and r["needs_review"], "persistent 500 does not use the fallback model")
+        os.environ["GROQ_FALLBACK_MODEL"] = ""
+        try:
+            fake([err(429, tpd), None])
+            r = run("inv1_acme_supplies.pdf")
+            check(len(FakeGroq.seen) == 1 and llm.groq_fallback_model() == "" and r["needs_review"] and "429" in r["reasons"],
+                  "GROQ_FALLBACK_MODEL empty: fallback disabled, TPD 429 fails as before")
+        finally:
+            os.environ.pop("GROQ_FALLBACK_MODEL", None)
 
         # --- tolerated model quirks
         fake([(200, {}, _chat_ok("Here you go:\n```json\n" + json.dumps(CANNED) + "\n```"))])

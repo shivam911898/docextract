@@ -11,6 +11,8 @@ real API and the real model's accuracy.
     $env:GROQ_API_KEY = "gsk_..."      # or put it in .env
     python smoke_groq.py
 Optional: GROQ_TEXT_MODEL to try another model (list ids: GET https://api.groq.com/openai/v1/models).
+If the model's daily token cap is hit, GROQ_FALLBACK_MODEL (default openai/gpt-oss-20b) answers instead and the
+"model" column shows it.
 """
 import os
 import sys
