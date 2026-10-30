@@ -46,7 +46,7 @@ Try the live demo: https://docextract-9vrp.onrender.com
 
 ## FAQ (6)
 **1. Which files can you handle?**
-PDFs (digital or scanned), PNG, JPG and phone photos, loose or in a ZIP. Digital PDFs (with selectable text) are the easiest and most accurate. Scans and photos have no text to read, so they go through OCR or an image-reading model first; I tell you up front which route your batch needs, and anything that cannot be read is flagged instead of guessed. By default I read the first 3 pages of each document; longer ones are fine, just tell me.
+PDFs (digital or scanned), PNG, JPG and phone photos, loose or in a ZIP. Digital PDFs (with selectable text) are the easiest and most accurate. Scans and photos have no text to read, so they are read by OCR (the live demo does this for phone photos and scanned PDFs) or by an image-reading model first, and the text is then extracted like any digital PDF. Accuracy on blurry, skewed or low-light photos is lower than on digital PDFs, which is why every OCR'd row is marked `source: ocr` with its confidence capped, and rows are flagged for review whenever the sums disagree; anything that cannot be read at all is flagged instead of guessed. By default I read the first 3 pages of each document; longer ones are fine, just tell me.
 
 **2. How accurate is it?**
 AI extraction is very good on clean documents but can misread blurry photos or unusual layouts, so I do not promise a magic number. Instead, every total is cross-checked and doubtful rows are separated for review. Send 10 of your own documents first and judge the result yourself, free.
@@ -69,5 +69,5 @@ No separate AI bill for typical batches: I use Groq's free-tier API, which cover
 ## Gig checklist before publishing
 - [x] Live demo deployed on Render's free tier: https://docextract-9vrp.onrender.com (URL is in the description and the Upwork blurb). It sleeps after about 15 minutes idle, so open it a minute before sharing it with a buyer.
 - [ ] Record the Loom (`DEMO_SCRIPT.md`) and add it as the gig video.
-- [ ] Screenshots exist in `docs/` (upload, results, needs-review; taken in no-key demo mode). Retake them from the live demo once the green AI banner shows, for the gig gallery.
+- [ ] Screenshots exist in `docs/` (upload, results, needs-review; taken from the local app with a Groq key, green status pill, OCR on). Retake them from the live demo once it is redeployed with the OCR image, for the gig gallery.
 - [ ] Make a gig thumbnail: Needs review tab with the flagged Greenleaf row visible.

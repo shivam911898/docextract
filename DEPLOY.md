@@ -12,11 +12,16 @@ is verified locally with `python verify.py`; treat the steps as a checklist and 
 
 ## A. Render (free, recommended for the demo)
 
-The `Dockerfile` installs `requirements.txt`, regenerates the sample documents inside the image, and starts Streamlit on
-`$PORT` (Render injects it; default 8501 locally). It runs as a non-root user.
+The `Dockerfile` installs `requirements.txt` and the lightweight OCR (`requirements-ocr.txt` plus
+`rapidocr-onnxruntime==1.4.4` with `--no-deps`, which keeps the image free of system GUI libraries), regenerates the
+sample documents inside the image, and starts Streamlit on `$PORT` (Render injects it; default 8501 locally). It runs as a
+non-root user and sets `OCR_THREADS=1` for the 0.1 CPU free instance.
 
 Free-tier facts: the instance spins down after about 15 minutes without traffic and cold-starts in about a minute;
-512 MB RAM (enough for this app without Docling); no persistent disk (not needed, files are processed in memory).
+512 MB RAM (the app plus RapidOCR peaked at about 310-330 MB RSS in local measurements; do not install Docling there);
+no persistent disk (not needed, files are processed in memory). With 0.1 CPU, OCR of one photo can take tens of seconds
+(an estimate: it was 1-3 s on a laptop core); the progress bar shows each file as it is read. The image grows by roughly
+150-200 MB (onnxruntime, headless OpenCV, the 16 MB of models). Rebuild and redeploy after changing the Dockerfile.
 
 ### 1. Push the code to GitHub
 The repo is `shivam911898/docextract`, with the `Dockerfile` in the repo root.
@@ -52,11 +57,15 @@ itself, so skip `git lfs install` (or delete `.gitattributes`) and plain binarie
 8. **Create Web Service**. Render builds the image and deploys.
 
 Do **not** set `GOOGLE_SERVICE_ACCOUNT_JSON` / `SHEET_ID` on a public demo: anyone could then append rows to your sheet.
-If you skip the API key, the app still works in no-key demo mode (text-layer PDFs only) and shows a banner saying so.
+If you skip the API key, the app still works in no-key demo mode (amber status pill; a heuristic parser reads text PDFs and
+the OCR text of scans and photos at lower confidence).
 
-Groq has no vision model, so on a Groq-only demo the PNG receipt in the sample set is flagged (`scanned image: needs a
-vision provider (Gemini) or the Docling OCR backend`). That is correct behaviour, and the sample run shows 2 flagged
-documents instead of 1. Docling (about 1.6 GB) is not installed on the free instance.
+Groq has no vision model, so scans and photos are read by the RapidOCR step baked into the image and the OCR text goes to
+the Groq text model. On a Groq-only demo the sample run therefore shows 1 flagged document (the deliberately wrong
+Greenleaf total) and the PNG receipt reads `HARBOR STREET GRILL`, total 90.68, marked `source: OCR`. If the OCR packages
+are missing from an image, the pill says `OCR: not installed` and the PNG is flagged (`scanned image: needs a vision
+provider (Gemini) or an OCR backend ...`). Set `OCR_BACKEND=none` to switch the OCR off on purpose. Docling (about 1.6 GB)
+is not installed on the free instance.
 
 ### 3. Watch the build and test
 1. Service page -> **Logs**. The first build takes a few minutes (installs `requirements.txt`).
@@ -88,13 +97,15 @@ documents instead of 1. Docling (about 1.6 GB) is not installed on the free inst
 |---------|-----|
 | Build fails while installing requirements | Read the **Logs** tab for the failing package; the `streamlit==` line in `requirements.txt` is the pin to check first. |
 | Service stays "deploying" / health check fails | Confirm **Health Check Path** is exactly `/_stcore/health` and the service is the Docker runtime (the `CMD` binds `0.0.0.0:$PORT`). |
-| Out of memory / instance restarts | The free tier has 512 MB. Do not install Docling there; lower `MAX_FILES`. |
+| Out of memory / instance restarts | The free tier has 512 MB. Do not install Docling there; lower `MAX_FILES`, set `OCR_MAX_PIXELS=700000` (smaller pages, less OCR memory), or `OCR_BACKEND=none` to drop OCR. |
+| Build fails at the `rapidocr` step | The two-step OCR install in the `Dockerfile` needs Python below 3.13 (rapidocr-onnxruntime 1.4.4) and the pins in `requirements-ocr.txt`; the app runs without OCR, so you can also delete those lines. |
 | Very slow first page load | Normal cold start after the free instance slept (about a minute). |
-| Banner still says "No-key demo mode" | Variable name must be exactly `GROQ_API_KEY` (or `GEMINI_API_KEY`); save and let Render redeploy. |
+| Pill says "Demo mode" | Variable name must be exactly `GROQ_API_KEY` (or `GEMINI_API_KEY`); save and let Render redeploy. |
 | Rows say `extraction error: Groq HTTP 404 ... model_not_found` | Groq retired the model id. List live ids with `GET https://api.groq.com/openai/v1/models` and set `GROQ_TEXT_MODEL`. |
 | Rows say `extraction error: Groq HTTP 401` | The `GROQ_API_KEY` value is wrong or revoked. |
 | Rows say `extraction error: ... 404` on Gemini | `GEMINI_MODEL` is set to a Gemini 2.x model. Unset it. |
-| Images / scans say `scanned image: needs a vision provider` | Expected on Groq (text only). Use a Gemini key with `LLM_PROVIDER=gemini`, or run Docling locally. |
+| Images / scans say `scanned image: needs a vision provider` | No OCR backend is installed in that image (the pill shows `OCR: not installed`) or `OCR_BACKEND=none` is set. Rebuild with the OCR install from the `Dockerfile`, or use a Gemini key with `LLM_PROVIDER=gemini`. |
+| An OCR'd row has a wrong digit | OCR can misread blurry photos. The row is capped at confidence 0.85 and flagged when sums disagree; compare with the original in the Preview tab. |
 
 ### Hugging Face Spaces (PRO only now)
 Hugging Face Spaces is no longer a free host for server apps (checked 2026-10-30): the Space SDK choices are only
