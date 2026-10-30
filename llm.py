@@ -4,7 +4,7 @@
                                             set, else none (offline regex / heuristic extractor)
 
 Groq is used as a TEXT provider only (no vision-capable model is served on Groq at the moment): text-layer PDFs go
-straight to it, scans and photos need Gemini vision or the optional Docling OCR backend in front of it.
+straight to it, scans and photos are OCR'd first (ocr.py: RapidOCR / Tesseract, or Docling) or read by Gemini vision.
 
 Only provider selection and HTTP live here. Prompts, parsing into the pydantic `Document` and validation stay in
 core.py. Everything is read from the environment at call time, so tests can point GROQ_BASE_URL at a local fake server.

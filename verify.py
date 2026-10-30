@@ -7,15 +7,21 @@ Runs everything that can be verified offline, with no API key and no network:
   3. Gemini code path against a local FAKE Gemini server: retries on 503, parses the JSON, and degrades to a
      "Needs review" row (not a crash) when the API keeps failing. This proves our wiring, not Google's accuracy.
   4. Groq code path against a local FAKE OpenAI-compatible server: text PDFs go to the text model (Groq has no vision
-     model), scans / photos become Needs review rows unless Docling OCR is available, 429 is retried, persistent 500 /
-     malformed JSON / 401 become Needs review rows, provider selection rules, CLI wiring. Proves our wiring, not Groq's
-     accuracy (see smoke_groq.py).
-  5. Streamlit app smoke test (AppTest): provider banners, MAX_FILES cap, "Try the sample documents" summary cards.
-  6. Only if docling is installed: the optional EXTRACT_BACKEND=docling path (incl. OCR of the PNG receipt).
+     model), scans / photos are OCR'd first (OCR stubbed here) or become Needs review rows when no OCR backend exists,
+     Docling beats the lightweight OCR, OCR text lowers confidence, 429 is retried, persistent 500 / malformed JSON /
+     401 become Needs review rows, provider selection rules, CLI wiring. Proves our wiring, not Groq's accuracy (see
+     smoke_groq.py).
+  5. Streamlit app smoke test (AppTest): status pill (demo / Groq / OCR missing), MAX_FILES cap, "Try the 9 sample
+     documents" summary cards with "USD 2,259.22" style totals.
+  6. OCR helpers (row grouping, spacing repair, Tesseract adapter with a stub) plus, only when an OCR backend imports
+     (pip install -r requirements-ocr.txt), the real thing: the PNG receipt is read in no-key mode and through the fake
+     Groq server, a scanned PDF is OCR'd, the wrong-total Greenleaf invoice is still flagged. Skipped otherwise.
+  7. Only if docling is installed: the optional EXTRACT_BACKEND=docling path (incl. OCR of the PNG receipt).
 """
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,8 +41,9 @@ sys.path.insert(0, str(ROOT))
 import core  # noqa: E402
 import llm  # noqa: E402
 import make_samples  # noqa: E402
+import ocr  # noqa: E402
 
-for _k in ("LLM_PROVIDER", "GEMINI_BASE_URL", "GROQ_BASE_URL", "GROQ_TEXT_MODEL"):
+for _k in ("LLM_PROVIDER", "GEMINI_BASE_URL", "GROQ_BASE_URL", "GROQ_TEXT_MODEL", "OCR_BACKEND"):
     os.environ.pop(_k, None)           # a stray .env must not change what is being verified
 core.MAX_FILES = 10
 
@@ -51,11 +58,12 @@ def check(cond, msg):
 
 # --------------------------------------------------------------------------- 1. CLI
 def stage_cli():
-    print("\n[1] CLI on samples/ (no-key mode)")
+    print("\n[1] CLI on samples/ (no-key mode, OCR switched off so the PNG stays flagged; OCR is tested in [6])")
     with tempfile.TemporaryDirectory() as tmp:
         out, xlsx = Path(tmp) / "out.csv", Path(tmp) / "out.xlsx"
         cp = subprocess.run([sys.executable, "extract.py", "samples", "--out", str(out), "--xlsx", str(xlsx), "--no-key"],
-                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            env={**os.environ, "OCR_BACKEND": "none"})
         print("\n".join("      " + l for l in cp.stdout.splitlines()))
         check(cp.returncode == 0, f"extract.py exit code 0 (got {cp.returncode}) {cp.stderr.strip()[-200:]}")
         df = pd.read_csv(out)
@@ -69,6 +77,8 @@ def stage_cli():
               f"flagged set = wrong-total invoice + the PNG receipt (needs key): {sorted(flagged.file)}")
         png = df[df.file == "rcpt4_harbor_grill.png"].iloc[0]
         check(core.SCANNED_MSG in str(png.review_reason), f"PNG without an AI/OCR route: {png.review_reason}")
+        check(list(df.columns)[-2:] == ["mode", "source"] and set(df.source.dropna()) == {"text"},
+              f"CSV has a source column: text-layer PDFs say 'text', the unreadable PNG is blank ({sorted(df.source.dropna().unique())})")
         check({"invoice", "receipt"} <= set(df.doc_type.dropna()), "both document types detected")
         # accuracy against what the generator actually printed (text-layer files only)
         wrong = []
@@ -201,7 +211,7 @@ class FakeGroq(BaseHTTPRequestHandler):
         FakeGroq.seen.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
         step = FakeGroq.queue.pop(0) if FakeGroq.queue else FakeGroq.fallback
         if step is None:
-            receipt = "HARBOR STREET GRILL" in body["messages"][0]["content"]
+            receipt = "HARBOR" in body["messages"][0]["content"]       # OCR may print it as HARBORSTREET GRILL
             step = (200, {}, _chat_ok(json.dumps(CANNED_RECEIPT if receipt else CANNED)))
         status, headers, payload = step
         data = json.dumps(payload).encode()
@@ -282,35 +292,72 @@ def stage_groq_mock():
         check(r["mode"] == "groq" and r["model"] == b["model"] and (d.doc_type, d.document_number, d.total) == ("invoice", "AC-10482", 199.23)
               and not r["needs_review"], "text PDF: JSON parsed into Document, validated clean, result tagged groq + model")
 
-        # --- scans / photos: Groq has no vision model, so no API call is made. Without Docling -> Needs review.
-        real_avail, real_ocr = core.docling_available, core.docling_text
+        # --- scans / photos: Groq has no vision model, so no API call is made for the image itself. The text comes
+        # from OCR (Docling if installed, else RapidOCR / Tesseract); with neither -> Needs review.
+        real_avail, real_docling, real_ocr_text, real_ocr_ok = core.docling_available, core.docling_text, core.ocr_text, ocr.available
         src = Image.open(io.BytesIO(core.render_first_page(Path("samples/inv1_acme_supplies.pdf").read_bytes(), "x.pdf"))).convert("RGB")
         pdf = io.BytesIO(); src.save(pdf, "PDF", save_all=True, append_images=[src] * 3)
         no_text = core.pdf_text(pdf.getvalue(), "scan.pdf").strip() == ""
-        want = "extraction error: scanned image: needs a vision provider (Gemini) or the Docling OCR backend"
+        want = "extraction error: " + core.SCANNED_MSG
+        ocr_text = "HARBOR STREET GRILL\n77 Pier Road, Boston, MA 02110\nCheck 5521  Jun 21, 2025\nClam Chowder 9.50\nTotal 90.68"
         try:
             core.docling_available = lambda: False
+            os.environ["OCR_BACKEND"] = "none"
             fake()
             r1 = run("rcpt4_harbor_grill.png")
             r2 = run("scan.pdf", pdf.getvalue())
             check(not FakeGroq.seen and r1["reasons"] == want and r2["reasons"] == want and r1["needs_review"] and r2["needs_review"],
-                  f"PNG photo and scanned PDF without Docling: no API call, Needs review: {r1['reasons']}")
-            check(no_text and r1["model"] == "" and r1["mode"] == "groq", "scanned PDF really has no text layer; row tagged groq, no model used")
+                  f"PNG photo and scanned PDF with no OCR backend: no API call, Needs review: {r1['reasons']}")
+            check(no_text and r1["model"] == "" and r1["mode"] == "groq" and r1["source"] == "",
+                  "scanned PDF really has no text layer; row tagged groq, no model used, no source")
+            check("off" in core.provider_label() or "need Gemini or an OCR backend" in core.provider_label(),
+                  f"provider label says scans need OCR when it is off: {core.provider_label()}")
 
-            # --- with Docling installed (stubbed): OCR text goes to the text model like any text PDF
-            ocr = "HARBOR STREET GRILL\n77 Pier Road, Boston, MA 02110\nCheck 5521  Jun 21, 2025\nClam Chowder 9.50\nTotal 90.68"
-            core.docling_available, core.docling_text = (lambda: True), (lambda data, name: ocr)
+            # --- lightweight OCR (stubbed, so this runs without the package): OCR text -> Groq text model
+            os.environ.pop("OCR_BACKEND", None)
+            ocr.available = lambda: True
+            ocr_calls = []
+            core.ocr_text = lambda data, name: (ocr_calls.append(name), (ocr_text, 0.97))[1]
             fake()
             r = run("rcpt4_harbor_grill.png")
-            check(len(FakeGroq.seen) == 1 and "HARBOR STREET GRILL" in content_of() and FakeGroq.seen[0]["body"]["model"] == "openai/gpt-oss-120b"
+            check(len(FakeGroq.seen) == 1 and "HARBOR STREET GRILL" in content_of() and "read from an image by OCR" in content_of()
+                  and FakeGroq.seen[0]["body"]["model"] == "openai/gpt-oss-120b" and ocr_calls == ["rcpt4_harbor_grill.png"]
                   and r["document"].vendor == CANNED_RECEIPT["vendor"] and not r["needs_review"] and r["mode"] == "groq",
-                  "PNG photo with Docling OCR (stub): OCR text -> Groq text model, receipt parsed and validated clean")
+                  "PNG photo with OCR (stub): OCR text (+ an OCR caution) -> Groq text model, receipt parsed and validated clean")
+            check(r["source"] == "ocr" and r["document"].confidence == core.OCR_CONFIDENCE_CAP == 0.85,
+                  f"OCR rows are marked source=ocr and confidence is capped (model said 0.9, row says {r['document'].confidence})")
+            core.ocr_text = lambda data, name: (ocr_text, 0.6)
+            fake()
+            r = run("rcpt4_harbor_grill.png")
+            check(r["needs_review"] and "low confidence 0.60" in r["reasons"], f"OCR engine unsure (0.60) -> flagged: {r['reasons']}")
+            fake()
+            core.ocr_text = lambda data, name: (ocr_text, 0.97)
+            run("inv1_acme_supplies.pdf")
+            check(len(FakeGroq.seen) == 1 and "OCR" not in content_of(), "text-layer PDF never goes through OCR")
+
+            # --- Docling wins over the lightweight OCR when both exist
+            core.docling_available, core.docling_text = (lambda: True), (lambda data, name: ocr_text)
+            core.ocr_text = lambda data, name: ("should not be used", 1.0)
+            fake()
+            r = run("rcpt4_harbor_grill.png")
+            check(len(FakeGroq.seen) == 1 and "HARBOR STREET GRILL" in content_of() and "should not be used" not in content_of()
+                  and r["source"] == "ocr" and not r["needs_review"], "Docling installed: used before the lightweight OCR")
+            core.docling_available, core.docling_text = (lambda: False), real_docling
+
+            # --- no key: the same OCR text feeds the heuristic parser
+            core.ocr_text = lambda data, name: ("HARBOR STREET GRILL\n77 Pier Road\nJun 21, 2025\n1 Clam Chowder   9.50\nSubtotal   9.50\nSales Tax   0.69\nTOTAL   $10.19\nPaid: Visa ****1111", 0.97)
+            r = core.process_file("rcpt4_harbor_grill.png", Path("samples/rcpt4_harbor_grill.png").read_bytes(), force_heuristic=True)
+            check(r["mode"] == "heuristic" and r["source"] == "ocr" and r["document"].total == 10.19 and r["document"].confidence <= 0.72
+                  and not r["needs_review"], f"no key: OCR text parsed by the heuristic parser ({r['document'].total}, {r['reasons']})")
+
             core.docling_text = lambda data, name: "  .  "
+            core.docling_available = lambda: True
             fake()
             r = run("rcpt4_harbor_grill.png")
             check(not FakeGroq.seen and r["needs_review"] and "no readable text" in r["reasons"], "OCR that finds nothing -> Needs review, no API call")
         finally:
-            core.docling_available, core.docling_text = real_avail, real_ocr
+            core.docling_available, core.docling_text, core.ocr_text, ocr.available = real_avail, real_docling, real_ocr_text, real_ocr_ok
+            os.environ.pop("OCR_BACKEND", None)
 
         # --- 429 then success: retried
         fake([err(429, "Rate limit reached for model", {"Retry-After": "0"})])
@@ -366,17 +413,16 @@ def stage_groq_mock():
                   and len(FakeGroq.seen) == 1, f"CLI with GROQ_API_KEY: the PDF goes through Groq, not flagged {cp.stderr.strip()[-150:]}")
 
         # --- smoke_groq.py (the owner's live test) runs end to end against the fake: 9 rows, the model shown.
-        # (Without Docling the PNG makes no API call and is flagged; with Docling installed it is really OCR'd.)
-        import importlib.util
-        has_docling = importlib.util.find_spec("docling") is not None
+        # (With no OCR backend the PNG makes no API call and is flagged; with RapidOCR / Docling it is really OCR'd.)
+        has_ocr = core.ocr_available()
         fake()
         cp = subprocess.run([sys.executable, "smoke_groq.py"], capture_output=True, text=True, encoding="utf-8", errors="replace")
         rows = [l for l in cp.stdout.splitlines() if re.match(r"(inv|rcpt)\d_\S+\.(pdf|png)\s", l)]
         n_png = [l for l in rows if l.startswith("rcpt4")]
-        check(cp.returncode == 0 and len(rows) == 9 and len(FakeGroq.seen) == (9 if has_docling else 8)
-              and sum("openai/gpt-oss-120b" in l for l in rows) == (9 if has_docling else 8)
-              and (has_docling or ("YES" in n_png[0] and "scanned image" in cp.stdout)),
-              f"smoke_groq.py vs fake: 9 table rows, text model shown, scanned PNG {'OCR' if has_docling else 'flagged'} {cp.stderr.strip()[-150:]}")
+        check(cp.returncode == 0 and len(rows) == 9 and len(FakeGroq.seen) == (9 if has_ocr else 8)
+              and sum("openai/gpt-oss-120b" in l for l in rows) == (9 if has_ocr else 8)
+              and ((has_ocr and " ocr " in n_png[0]) or ("YES" in n_png[0] and "scanned image" in cp.stdout)),
+              f"smoke_groq.py vs fake: 9 table rows, text model shown, scanned PNG {'OCR' if has_ocr else 'flagged'} {cp.stderr.strip()[-150:]}")
         # Windows drops empty env vars from a child's environment, and the child would then load a developer's
         # local .env via python-dotenv - so remove the key AND disable dotenv for this subprocess.
         nokey_env = {k: v for k, v in os.environ.items() if k != "GROQ_API_KEY"}
@@ -398,19 +444,31 @@ def stage_app():
     from streamlit.testing.v1 import AppTest
     for name in ("streamlit", "streamlit.runtime.scriptrunner_utils.script_run_context"):
         logging.getLogger(name).setLevel(logging.ERROR)   # silence "missing ScriptRunContext" bare-mode noise
+    def md(t):
+        return " ".join(m.value for m in t.markdown)
+    has_ocr = core.ocr_available()
     at = AppTest.from_file("app.py", default_timeout=120).run()
     check(not at.exception, f"app loads without exception {[e.value for e in at.exception]}")
-    check(any("No-key" in w.value for w in at.warning), "no-key banner shown when provider is none")
+    check("dx-pill--warn" in md(at) and "Demo mode" in md(at), "amber status pill 'Demo mode' when provider is none")
+    check("How it reads your documents" in [e.label for e in at.expander] and "GROQ_API_KEY" in md(at),
+          "the long explanation lives in the 'How it reads your documents' expander")
     check(any("AI provider: none" in c.value for c in at.caption), "footer shows the provider (none)")
+    check(f"OCR: {core.ocr_label()}" in md(at) if has_ocr else "OCR: not installed" in md(at), f"pill shows the OCR ({core.ocr_label()})")
     os.environ["GROQ_API_KEY"] = "fake-groq-key"
     try:
         g = AppTest.from_file("app.py", default_timeout=120).run()
+        os.environ["OCR_BACKEND"] = "none"                  # the app must still work without any OCR package
+        nog = AppTest.from_file("app.py", default_timeout=120).run()
     finally:
         os.environ["GROQ_API_KEY"] = ""
-    check(not g.exception and not any("No-key" in w.value for w in g.warning)
-          and any("Groq" in s.value and "openai/gpt-oss-120b" in s.value and "text-layer PDFs" in s.value for s in g.success),
-          "with GROQ_API_KEY: green Groq banner naming the model and its text-only scope, no no-key banner")
+        os.environ.pop("OCR_BACKEND", None)
+    check(not g.exception and "dx-pill--ok" in md(g) and "Groq gpt-oss-120b" in md(g) and "Demo mode" not in md(g)
+          and "Groq (openai/gpt-oss-120b)" in md(g),
+          "with GROQ_API_KEY: green pill naming Groq and the model, explanation names the model, no demo pill")
     check(any("AI provider: Groq" in c.value for c in g.caption), "footer shows the Groq provider and models")
+    check(not nog.exception and "OCR: not installed" in md(nog) and "no OCR backend is installed" in md(nog)
+          and "scans and photos need Gemini or an OCR backend" in "".join(c.value for c in nog.caption),
+          "OCR missing (OCR_BACKEND=none): app still loads, pill and explanation say so")
     core.MAX_FILES = 5
     try:
         cap = AppTest.from_file("app.py", default_timeout=120).run()
@@ -423,14 +481,116 @@ def stage_app():
     at.button(key="sample_btn").click().run()
     check(not at.exception, f"sample run without exception {[e.value for e in at.exception]}")
     m = {x.label: x.value for x in at.metric}
-    print("      cards:", m)
+    totals = [x.value for x in at.metric if x.label == "Total amount"]
+    print("      cards:", m, totals)
     check(m.get("Files processed") == "9" and int(m.get("Needs review", 0)) >= 1, "summary cards: 9 processed, >= 1 flagged")
-    check({"Total amount (USD)", "Total amount (GBP)", "Total amount (EUR)"} <= set(m), "per-currency total cards (USD, GBP, EUR)")
+    check(sorted(t.split()[0] for t in totals) == ["EUR", "GBP", "USD"] and all(re.fullmatch(r"[A-Z]{3} [\d,]+\.\d{2}", t) for t in totals),
+          f"per-currency total cards read like 'USD 2,259.22' (USD, GBP, EUR): {totals}")
+    check(any(t.label.startswith("Needs review (") for t in at.tabs), f"Needs review tab carries the count: {[t.label for t in at.tabs]}")
 
 
-# --------------------------------------------------------------------------- 6. optional Docling backend
+# --------------------------------------------------------------------------- 6. OCR (lightweight backend)
+def stage_ocr():
+    print("\n[6] OCR: helpers always, the real backend when installed")
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    # --- pure helpers (no OCR package needed)
+    check(ocr.respace("77PierRoad,Boston,MA 02110") == "77 Pier Road, Boston, MA 02110"
+          and ocr.respace("Jun 21,2025 7:48PM") == "Jun 21, 2025 7:48 PM" and ocr.respace("1Clam Chowder") == "1 Clam Chowder",
+          "respace puts back the spaces the recogniser drops (PierRoad, 21,2025, 7:48PM, 1Clam)")
+    check(ocr.respace("McDonald's iPhone 1,234.56 AC-10482") == "McDonald's iPhone 1,234.56 AC-10482",
+          "respace leaves brand names, thousands separators and ids alone")
+    boxes = [(620, 52, 690, 72, "28.50", .9), (60, 10, 200, 30, "Clam Chowder", .99), (60, 50, 150, 70, "Fish Tacos", .9),
+             (620, 12, 680, 32, "9.50", .99), (10, 100, 50, 120, "Sales", .9), (55, 101, 90, 121, "Tax", .9)]
+    check(ocr.boxes_to_text(boxes) == "Clam Chowder   9.50\nFish Tacos   28.50\nSales Tax",
+          f"boxes become reading-order rows, a wide gap becomes a 3-space column: {ocr.boxes_to_text(boxes)!r}")
+    check(ocr.boxes_to_text([]) == "" and ocr.boxes_to_text([(0, 0, 5, 5, "  ", 1.0)]) == "", "no text -> empty string")
+
+    # --- backend selection (OCR_BACKEND)
+    real_ready, real_backend = ocr._ready, ocr.backend
+    try:
+        ocr._ready = lambda name: True
+        sel = {}
+        for want in ("", "auto", "rapidocr", "tesseract", "none", "bogus"):
+            os.environ["OCR_BACKEND"] = want
+            sel[want] = ocr.backend()
+        check(sel == {"": "rapidocr", "auto": "rapidocr", "rapidocr": "rapidocr", "tesseract": "tesseract", "none": "none",
+                      "bogus": "rapidocr"}, f"OCR_BACKEND selection when both are installed: {sel}")
+        ocr._ready = lambda name: name == "tesseract"
+        os.environ["OCR_BACKEND"] = "auto"
+        a = ocr.backend()
+        os.environ["OCR_BACKEND"] = "rapidocr"
+        check(a == "tesseract" and ocr.backend() == "none" and not ocr.available(),
+              "auto falls back to Tesseract; an explicit rapidocr that is not installed means none")
+        # --- Tesseract adapter with a stub pytesseract (no binary needed)
+        os.environ["OCR_BACKEND"] = "tesseract"
+        sys.modules["pytesseract"] = SimpleNamespace(
+            Output=SimpleNamespace(DICT="dict"),
+            image_to_data=lambda img, lang, output_type: {"text": ["Total", "", "$90.68", "Tip"], "conf": ["96", "-1", "95", "90"],
+                                                          "left": [380, 0, 590, 380], "top": [544, 0, 544, 510],
+                                                          "width": [95, 0, 95, 40], "height": [28, 0, 28, 28]})
+        buf = io.BytesIO(); Image.new("RGB", (800, 600), "white").save(buf, "PNG")
+        text, score = ocr.read_pages([buf.getvalue()])
+        check(text == "Tip\nTotal   $90.68" and score == 0.937, f"Tesseract adapter (stub): words -> rows, mean confidence: {text!r} {score}")
+    finally:
+        sys.modules.pop("pytesseract", None)
+        ocr._ready, ocr.backend = real_ready, real_backend
+        os.environ.pop("OCR_BACKEND", None)
+    check(ocr._scale((4000, 3000)) < 1 and ocr._scale((744, 1052)) == 1.0 and 4000 * 3000 * ocr._scale((4000, 3000)) ** 2 <= ocr.MAX_PIXELS * 1.01,
+          "big phone photos are shrunk to the pixel budget; the 744x1052 sample is left alone")
+
+    # --- the real backend
+    if not ocr.available():
+        print("SKIP  no OCR backend installed (pip install -r requirements-ocr.txt, then pip install --no-deps "
+              "rapidocr-onnxruntime==1.4.4; or OCR_BACKEND=tesseract with the tesseract binary)")
+        return
+    print(f"      real OCR backend: {ocr.label()}")
+    png = Path("samples/rcpt4_harbor_grill.png").read_bytes()
+    r = core.process_file("rcpt4_harbor_grill.png", png, force_heuristic=True)
+    d = r["document"]
+    check("HARBOR" in (d.vendor or "").upper() and d.total is not None and abs(d.total - 90.68) <= 0.05,
+          f"no key, real OCR: PNG receipt read: vendor {d.vendor!r}, total {d.total}")
+    check(r["source"] == "ocr" and r["mode"] == "heuristic" and d.confidence <= core.OCR_CONFIDENCE_CAP and not r["needs_review"],
+          f"... marked source=ocr, confidence {d.confidence} (<= {core.OCR_CONFIDENCE_CAP}), validated clean ({r['reasons']})")
+    gl = Path("samples/inv3_greenleaf_catering.pdf").read_bytes()
+    r = core.process_file("inv3_greenleaf_catering.pdf", gl, force_heuristic=True)
+    check(r["needs_review"] and "total" in r["reasons"] and r["source"] == "text", f"Greenleaf wrong-total PDF still flagged: {r['reasons']}")
+    page = Image.open(io.BytesIO(core.render_first_page(gl, "x.pdf"))).convert("RGB")
+    scan = io.BytesIO(); page.save(scan, "PDF")
+    r = core.process_file("greenleaf_scan.pdf", scan.getvalue(), force_heuristic=True)
+    check(r["source"] == "ocr" and r["needs_review"] and "total" in r["reasons"],
+          f"... and the same invoice as an image-only scan (OCR'd) is flagged too: {r['reasons'][:90]}")
+
+    srv = HTTPServer(("127.0.0.1", 0), FakeGroq)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    os.environ["GROQ_API_KEY"], os.environ["GROQ_BASE_URL"] = "fake-groq-key", f"http://127.0.0.1:{srv.server_port}/openai/v1"
+    try:
+        FakeGroq.queue, FakeGroq.fallback = [], None
+        FakeGroq.seen.clear()
+        r = core.process_file("rcpt4_harbor_grill.png", png)
+        content = FakeGroq.seen[-1]["body"]["messages"][0]["content"]
+        d = r["document"]
+        check(r["mode"] == "groq" and "HARBOR" in content and "TOTAL" in content and "90.68" in content,
+              "Groq + real OCR: the PNG's OCR text (HARBOR ... TOTAL 90.68) is what the text model receives")
+        check((d.vendor, d.total, r["source"], d.confidence, r["needs_review"]) == ("HARBOR STREET GRILL", 90.68, "ocr", 0.85, False),
+              f"... parsed, source=ocr, confidence capped at 0.85, not flagged ({d.vendor}, {d.total}, {d.confidence})")
+        FakeGroq.seen.clear()
+        invoice = io.BytesIO(); Image.open(io.BytesIO(core.render_first_page(Path("samples/inv1_acme_supplies.pdf").read_bytes(), "x.pdf"))).convert("RGB").save(invoice, "PDF")
+        r = core.process_file("acme_scan.pdf", invoice.getvalue())
+        content = FakeGroq.seen[-1]["body"]["messages"][0]["content"]
+        check("Acme" in content and r["source"] == "ocr" and r["document"].total == 199.23,
+              "Groq + real OCR: an image-only PDF is rendered (pypdfium2), OCR'd and sent as text")
+    finally:
+        srv.shutdown()
+        os.environ["GROQ_API_KEY"] = ""
+        os.environ.pop("GROQ_BASE_URL", None)
+
+
+# --------------------------------------------------------------------------- 7. optional Docling backend
 def stage_docling():
-    print("\n[6] Optional Docling backend (EXTRACT_BACKEND=docling)")
+    print("\n[7] Optional Docling backend (EXTRACT_BACKEND=docling)")
     import importlib.util
     if importlib.util.find_spec("docling") is None:
         print("SKIP  docling not installed (pip install -r requirements-docling.txt to include this stage)")
@@ -454,7 +614,7 @@ def stage_docling():
 
 
 if __name__ == "__main__":
-    for stage in (stage_cli, stage_zip, stage_gemini_mock, stage_groq_mock, stage_app, stage_docling):
+    for stage in (stage_cli, stage_zip, stage_gemini_mock, stage_groq_mock, stage_app, stage_ocr, stage_docling):
         try:
             stage()
         except Exception as e:  # a crashing stage is a failure, not a traceback wall

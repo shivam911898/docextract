@@ -2,8 +2,9 @@
 
 Runs the 9 bundled samples through the Groq path and prints one row per file: file, type, vendor, total,
 needs_review, model used, plus whether the values match what the sample generator printed. Groq reads text only, so
-the 8 text-layer PDFs go to the text model; the PNG receipt has no text layer and is flagged ("scanned image: needs
-a vision provider (Gemini) or the Docling OCR backend") unless Docling is installed, in which case it is OCR'd first.
+the 8 text-layer PDFs go to the text model; the PNG receipt has no text layer, so it is OCR'd first (RapidOCR, see
+ocr.py / requirements-ocr.txt; or Docling) and the OCR text goes to the same model. Without any OCR backend it is
+flagged ("scanned image: needs a vision provider (Gemini) or an OCR backend").
 `python verify.py` proves the wiring offline against a fake server; this script is the only thing that exercises the
 real API and the real model's accuracy.
 
@@ -42,12 +43,12 @@ def main() -> int:
                    currency=g["currency"], tax=g["tax"], total=g["total"])
         bad = [k for k in exp if got[k] != exp[k]]
         rows.append((g["file"], d.doc_type or "-", (d.vendor or "-")[:28], "-" if d.total is None else f"{d.total:,.2f}",
-                     "YES" if r["needs_review"] else "no", r["model"] or "-",
+                     "YES" if r["needs_review"] else "no", r["model"] or "-", r["source"] or "-",
                      "ok" if not bad else ("not read" if d.total is None and not d.vendor else "differs: " + ",".join(bad)),
                      r["reasons"]))
         print(f"  done {g['file']}", flush=True)
-    head = ("file", "type", "vendor", "total", "needs_review", "model", "vs ground truth")
-    table = [head] + [r[:7] for r in rows]
+    head = ("file", "type", "vendor", "total", "needs_review", "model", "source", "vs ground truth")
+    table = [head] + [r[:8] for r in rows]
     widths = [max(len(str(row[i])) for row in table) for i in range(len(head))]
     print()
     for n, row in enumerate(table):
@@ -57,9 +58,9 @@ def main() -> int:
     flagged = [r for r in rows if r[4] == "YES"]
     print(f"\n{len(rows)} files in {time.time() - t0:.0f}s, {len(flagged)} need review "
           "(expected: inv3_greenleaf_catering.pdf, the deliberately wrong total; plus rcpt4_harbor_grill.png "
-          "unless Docling OCR is installed).")
+          "only if no OCR backend is installed).")
     for r in flagged:
-        print(f"  {r[0]}: {r[7]}")
+        print(f"  {r[0]}: {r[8]}")
     return 0
 
 

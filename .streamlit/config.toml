@@ -10,6 +10,20 @@ enableCORS = false
 [browser]
 gatherUsageStats = false
 
+[client]
+# Hides the Deploy button and the main menu (nothing in them is useful to a visitor of the demo).
+toolbarMode = "minimal"
+
+# Shared portfolio design system (ui.py carries the CSS for everything a theme cannot express).
 [theme]
 base = "light"
-primaryColor = "#1f3a5f"
+primaryColor = "#4F46E5"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0F172A"
+# Inter is loaded by an @import in ui.py; the rest of the stack is the fallback while it loads or when offline.
+font = "Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+baseRadius = "12px"
+borderColor = "#E2E8F0"
+dataframeBorderColor = "#E2E8F0"
+dataframeHeaderBackgroundColor = "#F1F5F9"

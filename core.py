@@ -1,8 +1,9 @@
 """DocExtract core: extraction + validation logic shared by the Streamlit app and the CLI.
 
-Pipeline per file:  ingest (PDF/PNG/JPG, or a .zip of them)  ->  extract (Groq text model for text-layer PDFs, Gemini
-vision for scans and photos, or regex/heuristic without a key)  ->  validate (arithmetic cross-checks)  ->  flat row +
-line items for CSV / XLSX / Google Sheets.
+Pipeline per file:  ingest (PDF/PNG/JPG, or a .zip of them)  ->  extract (Groq text model for text, Gemini vision for
+scans and photos, or regex/heuristic without a key; scans and photos reach the text routes through OCR: Docling if
+installed, else the lightweight RapidOCR / Tesseract in ocr.py)  ->  validate (arithmetic cross-checks)  ->  flat row
++ line items for CSV / XLSX / Google Sheets.
 """
 from __future__ import annotations
 
@@ -26,11 +27,13 @@ except Exception:  # pragma: no cover
     pass
 
 import llm  # noqa: E402  (after load_dotenv so .env is already in the environment)
+import ocr  # noqa: E402
 
 # ---------------------------------------------------------------- settings
 TOLERANCE = 0.005          # relative tolerance for arithmetic checks (0.5%) ...
 ABS_TOLERANCE = 0.05       # ... or this many currency units, whichever is larger (rounding noise)
 MIN_CONFIDENCE = 0.7
+OCR_CONFIDENCE_CAP = 0.85  # text that went through OCR can have misread digits: confidence never exceeds this
 IMG_EXTS = {".png", ".jpg", ".jpeg"}
 EXTS = {".pdf"} | IMG_EXTS
 DOC_TYPES = ("invoice", "receipt", "other")
@@ -77,15 +80,27 @@ def active_provider() -> str:
     return llm.provider()
 
 
+def ocr_label() -> str:
+    """The OCR that reads scans and photos for the text routes: 'Docling' (if installed, it wins), 'RapidOCR',
+    'Tesseract' (see ocr.py and OCR_BACKEND) or 'off'."""
+    return "Docling" if docling_available() else ocr.label()
+
+
+def ocr_available() -> bool:
+    return docling_available() or ocr.available()
+
+
 def provider_label() -> str:
-    """One line for the UI / CLI: which provider and models are in use."""
+    """One line for the UI / CLI: which provider and models are in use, and which OCR reads scans and photos."""
     p = active_provider()
+    name = ocr_label()
+    scans = (f"scans and photos read by OCR ({name})" if name != "off"
+             else "scans and photos need Gemini or an OCR backend")
     if p == "groq":
-        ocr = "Docling OCR for scans" if docling_available() else "scans and photos need Gemini or Docling OCR"
-        return f"Groq: {llm.groq_text_model()} (text-layer PDFs; {ocr})"
+        return f"Groq: {llm.groq_text_model()} (text-layer PDFs; {scans})"
     if p == "gemini":
-        return f"Gemini: {GEMINI_MODEL}"
-    return "none (offline regex / heuristic extractor)"
+        return f"Gemini: {GEMINI_MODEL} (reads PDFs, scans and photos with vision)"
+    return f"none (offline regex / heuristic extractor; {scans})"
 
 
 def _png(img) -> bytes:
@@ -99,8 +114,8 @@ def render_pages(data: bytes, filename: str, max_pages: int = MAX_PAGES) -> List
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(data)
         return [_png(pdf[i].render(scale=2).to_pil()) for i in range(min(len(pdf), max_pages))]
-    from PIL import Image
-    return [_png(Image.open(io.BytesIO(data)))]
+    from PIL import Image, ImageOps
+    return [_png(ImageOps.exif_transpose(Image.open(io.BytesIO(data))))]      # phone photos: honour the EXIF rotation
 
 
 def render_first_page(data: bytes, filename: str) -> bytes:
@@ -166,6 +181,33 @@ def docling_text(data: bytes, filename: str) -> str:
     _docling_converter = _docling_converter or DocumentConverter()
     res = _docling_converter.convert(DocumentStream(name=Path(filename).name, stream=io.BytesIO(data)))
     return _md_to_lines(res.document.export_to_markdown())
+
+
+def ocr_text(data: bytes, filename: str) -> Tuple[str, Optional[float]]:
+    """OCR with the lightweight backend (ocr.py): PDF pages are rendered with pypdfium2, images are decoded as they
+    are. Returns (text, mean OCR confidence 0-1)."""
+    pages = render_pages(data, filename) if Path(filename).suffix.lower() == ".pdf" else [data]
+    return ocr.read_pages(pages)
+
+
+def scan_text(data: bytes, filename: str) -> Tuple[str, Optional[float]]:
+    """Text of a file that has no text layer (photo, image, scanned PDF): Docling if installed, else the lightweight
+    OCR, else ScannedImageError (the Needs review row). Returns (text, OCR confidence or None)."""
+    if docling_available():
+        text, score = docling_text(data, filename), None
+    elif ocr.available():
+        text, score = ocr_text(data, filename)
+    else:
+        raise ScannedImageError(SCANNED_MSG)
+    if not _usable(text):
+        raise ValueError("no readable text found, even with OCR")
+    return text, score
+
+
+def ocr_confidence(conf: float, ocr_score: Optional[float] = None) -> float:
+    """Confidence of a document read from OCR text: capped at OCR_CONFIDENCE_CAP and never above how sure the OCR
+    engine itself was (a blurry photo that OCR struggled with lands under MIN_CONFIDENCE, so it is flagged)."""
+    return round(min(conf, OCR_CONFIDENCE_CAP, 1.0 if ocr_score is None else ocr_score), 2)
 
 
 def doc_text(data: bytes, filename: str) -> str:
@@ -273,6 +315,14 @@ GROQ_PROMPT = (
 )
 
 
+OCR_NOTE = (
+    "The text below was read from an image by OCR, so it can contain mistakes: words may be run together (for "
+    "example 'MAINSTREET CAFE' for 'MAIN STREET CAFE') and look-alike characters get confused (O/0, l/I/1). Restore "
+    "the missing spaces in names and descriptions, but copy every number exactly as it appears and never guess a "
+    "digit.\n"
+)
+
+
 def _doc_from_json(content: str) -> Document:
     """Parse a model reply into a Document. Tolerates code fences and chatter around the object and the usual
     model quirks (null line_items, 0-100 confidence); anything else raises, which becomes a Needs review row."""
@@ -295,7 +345,7 @@ def _doc_from_json(content: str) -> Document:
     return Document.model_validate(obj)
 
 
-SCANNED_MSG = "scanned image: needs a vision provider (Gemini) or the Docling OCR backend"
+SCANNED_MSG = "scanned image: needs a vision provider (Gemini) or an OCR backend (RapidOCR, Tesseract or Docling)"
 
 
 class ScannedImageError(ValueError):
@@ -306,20 +356,19 @@ def _usable(text: str) -> bool:
     return len("".join(text.split())) >= MIN_TEXT_CHARS
 
 
-def extract_groq(data: bytes, filename: str, text: str) -> Tuple[Document, str]:
+def extract_groq(data: bytes, filename: str, text: str) -> Tuple[Document, str, str, Optional[float]]:
     """Groq reads text only. A text-layer document goes to the text model as is. An image or scanned PDF (no usable
-    text layer) is OCR'd by Docling first when that optional backend is installed; otherwise it cannot be read here
-    and becomes a Needs review row. Returns (document, model id used)."""
+    text layer) is OCR'd first (scan_text: Docling if installed, else RapidOCR / Tesseract); with no OCR backend it
+    cannot be read here and becomes a Needs review row. Returns (document, model id, source, OCR confidence) where
+    source is 'text' (text layer) or 'ocr'."""
+    source, score = "text", None
     if not _usable(text):
-        if not docling_available():
-            raise ScannedImageError(SCANNED_MSG)
-        text = docling_text(data, filename)
-        if not _usable(text):
-            raise ValueError("no readable text found, even with Docling OCR")
+        text, score = scan_text(data, filename)
+        source = "ocr"
     model = llm.groq_text_model()
-    prompt = GROQ_PROMPT + "\nDocument text:\n" + text[:GROQ_TEXT_CHARS]
+    prompt = GROQ_PROMPT + (OCR_NOTE if source == "ocr" else "") + "\nDocument text:\n" + text[:GROQ_TEXT_CHARS]
     reply = llm.groq_chat_json([{"role": "user", "content": prompt}], model)
-    return _doc_from_json(reply), model
+    return _doc_from_json(reply), model, source, score
 
 
 # ---------------------------------------------------------------- heuristic (no key)
@@ -521,52 +570,64 @@ def validate(doc: Document) -> List[str]:
     return reasons
 
 
-def heuristic_from_file(name: str, data: bytes) -> Document:
+def heuristic_from_file(name: str, data: bytes) -> Tuple[Document, str, Optional[float]]:
     """No-key extraction. With EXTRACT_BACKEND=docling, text-layer PDFs are parsed from both the Docling text and the
-    pypdf text and the parse that validates cleaner wins (Docling adds OCR for images/scans and table structure)."""
-    texts = [doc_text(data, name)]
-    if Path(name).suffix.lower() == ".pdf" and os.getenv("EXTRACT_BACKEND", "").strip().lower() == "docling":
-        texts.append(pdf_text(data, name))
+    pypdf text and the parse that validates cleaner wins (Docling adds table structure). A file with no text layer
+    (photo, scan) is OCR'd first (scan_text); without an OCR backend it raises ScannedImageError.
+    Returns (document, source 'text' | 'ocr', OCR confidence or None)."""
+    source, score = "text", None
+    if _usable(pdf_text(data, name)):
+        texts = [doc_text(data, name)]
+        if os.getenv("EXTRACT_BACKEND", "").strip().lower() == "docling":
+            texts.append(pdf_text(data, name))
+    else:
+        text, score = scan_text(data, name)
+        texts, source = [text], "ocr"
     best = None
     for t in (t for t in texts if t.strip()):
         d = normalise(extract_heuristic(t))
-        score = (len(validate(d)), -d.confidence)
-        if best is None or score < best[0]:
-            best = (score, d)
+        score_ = (len(validate(d)), -d.confidence)
+        if best is None or score_ < best[0]:
+            best = (score_, d)
     if best is None:
         raise ScannedImageError(SCANNED_MSG)
-    return best[1]
+    return best[1], source, score
 
 
 def process_file(name: str, data: bytes, force_heuristic: bool = False) -> dict:
-    """Return a result dict for one file: {file, mode, model, document, needs_review, reasons}.
+    """Return a result dict for one file: {file, mode, model, source, document, needs_review, reasons}.
 
-    mode is 'groq', 'gemini' or 'heuristic'; model is the model id that read the file ('regex' for heuristic)."""
+    mode is 'groq', 'gemini' or 'heuristic'; model is the model id that read the file ('regex' for heuristic);
+    source is where the text came from: 'text' (PDF text layer), 'ocr' (scan or photo read by OCR; confidence is
+    capped, see ocr_confidence) or 'vision' (Gemini read the page image); '' for a row that failed to extract."""
     prov = "none" if force_heuristic else active_provider()
     mode = prov if prov in ("groq", "gemini") else "heuristic"
-    model, err = ("regex" if mode == "heuristic" else ""), None
+    model, err, source, score = ("regex" if mode == "heuristic" else ""), None, "", None
     try:
         is_pdf = Path(name).suffix.lower() == ".pdf"
         if mode == "gemini":   # images go to the vision model as-is; PDFs also pass their text layer as a hint
             doc, model = extract_gemini(render_pages(data, name), doc_text(data, name) if is_pdf else ""), GEMINI_MODEL
+            source = "vision"
         elif mode == "groq":
-            doc, model = extract_groq(data, name, doc_text(data, name) if is_pdf else "")
+            doc, model, source, score = extract_groq(data, name, doc_text(data, name) if is_pdf else "")
         else:
-            doc = heuristic_from_file(name, data)
+            doc, source, score = heuristic_from_file(name, data)
         doc = normalise(doc)
+        if source == "ocr":
+            doc.confidence = ocr_confidence(doc.confidence, score)
     except Exception as e:
-        doc = Document(confidence=0.0)
+        doc, source = Document(confidence=0.0), ""
         err = str(e) if isinstance(e, ScannedImageError) else f"{type(e).__name__}: {' '.join(str(e).split())[:300]}"
     reasons = validate(doc) if not err else []
     if err:
         reasons.insert(0, f"extraction error: {err}")
-    return {"file": name, "mode": mode, "model": model, "document": doc, "needs_review": bool(reasons),
-            "reasons": "; ".join(reasons)}
+    return {"file": name, "mode": mode, "model": model, "source": source, "document": doc,
+            "needs_review": bool(reasons), "reasons": "; ".join(reasons)}
 
 
 # ---------------------------------------------------------------- output
 COLUMNS = ["file", "doc_type", "vendor", "document_number", "date", "currency", "subtotal", "tax", "tip", "total",
-           "payment_method", "line_items", "confidence", "needs_review", "review_reason", "mode"]
+           "payment_method", "line_items", "confidence", "needs_review", "review_reason", "mode", "source"]
 ITEM_COLUMNS = ["file", "vendor", "description", "qty", "unit_price", "amount"]
 MONEY_COLS = ("subtotal", "tax", "tip", "total", "unit_price", "amount")
 
@@ -578,7 +639,8 @@ def to_row(r: dict) -> dict:
     return {"file": r["file"], "doc_type": d.doc_type, "vendor": d.vendor, "document_number": d.document_number,
             "date": d.date, "currency": d.currency, "subtotal": d.subtotal, "tax": d.tax, "tip": d.tip,
             "total": d.total, "payment_method": d.payment_method, "line_items": items, "confidence": d.confidence,
-            "needs_review": r["needs_review"], "review_reason": r["reasons"], "mode": r["mode"]}
+            "needs_review": r["needs_review"], "review_reason": r["reasons"], "mode": r["mode"],
+            "source": r.get("source", "")}
 
 
 def to_df(results: list) -> pd.DataFrame:

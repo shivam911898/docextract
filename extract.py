@@ -45,8 +45,11 @@ def main():
     ap.add_argument("--no-key", action="store_true", help="force the offline heuristic extractor even if a key is set")
     a = ap.parse_args()
     if a.no_key or core.active_provider() == "none":
+        scans = ("scans and photos are read by OCR (" + core.ocr_label() + ", confidence capped)"
+                 if core.ocr_available() else
+                 "scans and photos are flagged (they need GEMINI_API_KEY or an OCR backend: requirements-ocr.txt)")
         print("NOTE: heuristic text extractor (no AI key: set GROQ_API_KEY or GEMINI_API_KEY). "
-              "Lower confidence; images/scans are flagged (they need GEMINI_API_KEY or the Docling OCR backend).")
+              "Lower confidence; " + scans + ".")
     else:
         print("AI provider -", core.provider_label())
     results, notes = run(a.inputs, force_heuristic=a.no_key)

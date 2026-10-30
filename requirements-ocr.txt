@@ -1,0 +1,18 @@
+# Optional lightweight OCR for scans and phone photos (OCR_BACKEND=auto|rapidocr). CPU only, small enough for a 512 MB
+# host: about 70 MB extra RAM once loaded, about 300 MB peak process RSS in the app. See ocr.py and README.
+#
+#   pip install -r requirements-ocr.txt
+#   pip install --no-deps rapidocr-onnxruntime==1.4.4
+#
+# rapidocr-onnxruntime itself ships the PP-OCRv4 models (about 16 MB) but declares the full `opencv-python` as a
+# dependency, which needs system GUI libraries (libGL) that slim Docker images do not have. So the engine is installed
+# in a second step with --no-deps, and its dependencies are listed here with the headless OpenCV build instead.
+# (On a desktop, a plain `pip install rapidocr-onnxruntime==1.4.4` works too.) The Dockerfile does both steps.
+# Needs Python < 3.13 (the rapidocr-onnxruntime wheel metadata).
+opencv-python-headless==5.0.0.93
+onnxruntime==1.31.1
+pyclipper==1.4.0
+shapely==2.2.0
+pyyaml==6.0.3
+tqdm==4.70.1
+six==1.17.0
