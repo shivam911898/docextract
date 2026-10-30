@@ -3,6 +3,8 @@
 Drop in a pile of invoice and receipt PDFs, scans or phone photos (or one ZIP). Get one validated row per document,
 every line item, and a separate **Needs review** sheet for anything that does not add up.
 
+**Live demo:** <https://docextract-9vrp.onrender.com> *(free Render instance: it sleeps after about 15 minutes idle, so the first load can take about a minute; click "Try the sample documents")*
+
 ## The problem
 Small businesses, bookkeepers and agencies still retype vendor, number, date, tax and total from hundreds of
 documents into spreadsheets. It is slow (3-5 minutes per document by hand is a fair estimate), and one mistyped total

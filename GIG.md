@@ -40,6 +40,8 @@ You get:
 - Optional automation: new files in a folder or inbox processed on their own
 
 Not sure it will work on your documents? Send 10 samples before ordering and I will show you the result for free.
+
+Try the live demo: https://docextract-9vrp.onrender.com
 ```
 
 ## FAQ (6)
@@ -62,10 +64,10 @@ Yes. Standard includes a Google Sheets push or an import-ready CSV in the layout
 No separate AI bill for typical batches: I use Groq's free-tier API, which covers an order of this size (it is rate-limited, so very large batches simply take longer). For big or recurring volumes you can supply your own Groq or Gemini key, or a paid key, and the provider bills you directly at its published rates; I give you an estimate before starting.
 
 ## Upwork portfolio blurb
-> **DocExtract: AI invoice and receipt data extraction.** Built a tool that turns batches of invoice and receipt PDFs, scans and photos (USD/GBP/EUR, mixed layouts, ZIP upload) into validated Excel/CSV and Google Sheets rows, with every total cross-checked and doubtful documents routed to a "Needs review" sheet instead of being silently trusted. Python, Streamlit, AI (Groq or Gemini, your key) with an offline fallback; live demo and source available. Typically replaces hours of manual data entry per hundred documents.
+> **DocExtract: AI invoice and receipt data extraction.** Built a tool that turns batches of invoice and receipt PDFs, scans and photos (USD/GBP/EUR, mixed layouts, ZIP upload) into validated Excel/CSV and Google Sheets rows, with every total cross-checked and doubtful documents routed to a "Needs review" sheet instead of being silently trusted. Python, Streamlit, AI (Groq or Gemini, your key) with an offline fallback. Live demo: https://docextract-9vrp.onrender.com · Source: https://github.com/shivam911898/docextract Typically replaces hours of manual data entry per hundred documents.
 
 ## Gig checklist before publishing
-- [ ] Deploy the live demo on Render's free tier (see `DEPLOY.md`) and paste the live URL in the gig description and the Upwork portfolio item. It sleeps after about 15 minutes idle, so open it a minute before sharing it with a buyer.
+- [x] Live demo deployed on Render's free tier: https://docextract-9vrp.onrender.com (URL is in the description and the Upwork blurb). It sleeps after about 15 minutes idle, so open it a minute before sharing it with a buyer.
 - [ ] Record the Loom (`DEMO_SCRIPT.md`) and add it as the gig video.
 - [ ] Screenshots exist in `docs/` (upload, results, needs-review; taken in no-key demo mode). Retake them from the live demo once the green AI banner shows, for the gig gallery.
 - [ ] Make a gig thumbnail: Needs review tab with the flagged Greenleaf row visible.
