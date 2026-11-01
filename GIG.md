@@ -32,7 +32,7 @@ Pricing unit: per batch. **1 document = 1 invoice or receipt, up to 3 pages.** S
 
 **Custom offer (not a visible tier, send on request):**
 - 2,000+ documents, or monthly volume: about **$0.30-0.40 per document** (2,000 documents is roughly $600-$800), quoted after the free 10-document test.
-- Your own hosted copy of the tool with a watched folder or inbox, and a 30-minute handover call. Priced by quote.
+- Your own hosted copy of the tool with a watched folder or inbox, and a recorded handover video with written Q&A. Priced by quote.
 
 **Add-ons:**
 - +100 documents: **$40**
